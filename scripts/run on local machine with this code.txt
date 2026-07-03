@@ -1,0 +1,2 @@
+cd /d D:\downloads\utility_data_pipeline (1)\utility_data_pipeline\
+python run.py --company tepco --start 2017 --end 2025 --skip-scrape
