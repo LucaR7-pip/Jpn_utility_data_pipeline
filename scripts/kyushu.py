@@ -22,7 +22,7 @@ raising or forward-filling -- consistent with chugoku.py/shikoku.py's
 policy: an honest gap beats a silently-repeated stale value.
 """
 from datetime import date, datetime, timedelta
-
+import time
 import requests
 
 import common
@@ -39,9 +39,6 @@ MISSING_VALUE = None  # None -> blank cell in CSV / null in JSON; set 0.0 if pre
 # --------------------------------------------------------------------------
 # Downloader
 # --------------------------------------------------------------------------
-# No discover_links(): the URL pattern is fixed and date-driven (not a
-# handful of named files to discover), so there's nothing to scrape --
-# we just construct each day's URL directly and handle 404s gracefully.
 
 def download_daily_csv(day: date) -> bytes | None:
     url = f"{BASE}/juyo-hourly-{day:%Y%m%d}.csv"
@@ -50,7 +47,7 @@ def download_daily_csv(day: date) -> bytes | None:
         r.raise_for_status()
         return r.content
     except requests.exceptions.RequestException:
-        return None  # silent per-day; a year-end summary is printed instead
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -59,27 +56,47 @@ def download_daily_csv(day: date) -> bytes | None:
 
 def parse_daily_csv(raw_bytes: bytes) -> list[tuple[str, float]]:
     """Extract just the 24-row hourly block from one daily file."""
-    text = raw_bytes.decode("shift_jis")
+    # errors="replace" prevents fatal crashes from stray un-decodable characters
+    text = raw_bytes.decode("shift_jis", errors="replace")
     lines = text.splitlines()
 
     header_idx = None
     for i, l in enumerate(lines):
-        if l.startswith("DATE,TIME,当日実績(万kW)"):
+        # Robust substring check ignores invisible BOMs or slight header column variations
+        if "DATE" in l and "TIME" in l and "当日実績" in l:
             header_idx = i
             break
+            
     if header_idx is None:
-        raise ValueError("Could not find hourly header in Kyushu daily CSV")
+        # Failing gracefully allows the single day to be marked missing rather than crashing the year
+        return []
 
     rows = []
     for l in lines[header_idx + 1:]:
         l = l.strip()
-        if not l:
-            break  # blank line ends the hourly block
+        
+        # Stop safely if we hit a blank line OR the 5-minute table header
+        if not l or l.startswith("DATE") or "当日実績" in l:
+            break
+            
         parts = l.split(",")
+        if len(parts) < 3:
+            continue
+            
         date_str, time_str, val_mankw = parts[0], parts[1], parts[2]
-        dt = _to_datetime(date_str, time_str)
-        mw = _mankw_to_mw(val_mankw)
-        rows.append((dt.strftime("%Y-%m-%d %H:%M"), mw))
+        
+        try:
+            dt = _to_datetime(date_str, time_str)
+            mw = _mankw_to_mw(val_mankw)
+            rows.append((dt.strftime("%Y-%m-%d %H:%M"), mw))
+        except ValueError:
+            # Skip rows with entirely unparseable data rather than crashing
+            continue
+        
+        # Hourly block is strictly exactly 24 rows. Once reached, break out.
+        if len(rows) == 24:
+            break
+            
     return rows
 
 
@@ -93,7 +110,11 @@ def _mankw_to_mw(val: str):
     val = val.strip()
     if val in ("", "-", "*"):
         return None
-    return float(val) * 10.0
+    try:
+        # Prevent numbers containing commas like "1,234" from crashing the float cast
+        return float(val.replace(',', '')) * 10.0
+    except ValueError:
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -106,6 +127,16 @@ def build_year(year: int, links=None) -> list[tuple[str, float]]:
 
     day = date(year, 1, 1)
     end = date(year, 12, 31)
+    
+    # Optimization: Do not attempt to aggressively fetch dates in the future.
+    # Essential for avoiding infinite 404 flooding when run dynamically on future years.
+    today = date.today()
+    if year == today.year:
+        end = today
+    elif year > today.year:
+        print(f"  [{REGION}] {year} is in the future. Returning blank template.")
+        return [(ts, MISSING_VALUE) for ts in exp_hours]
+
     failed_days = []
     while day <= end:
         raw = download_daily_csv(day)
@@ -114,7 +145,9 @@ def build_year(year: int, links=None) -> list[tuple[str, float]]:
         else:
             for ts, mw in parse_daily_csv(raw):
                 source_lookup[ts] = mw
+        
         day += timedelta(days=1)
+        time.sleep(0.02) # Very slight delay to prevent aggressive server rate-limiting
 
     if failed_days:
         print(f"  [{REGION}] {len(failed_days)} day(s) unavailable, left blank "
